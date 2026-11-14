@@ -1,0 +1,100 @@
+# Vigia de fora do VPS da Fórmula Mídia (14/11/2026).
+#
+# Por que existe: em 13/11/2026 a Hostinger cortou a CPU do VPS a 5% e ele ficou
+# ~20 h sem responder (app, chat, crm, SSH). A sentinela que mora DENTRO do VPS
+# também não conseguiu avisar: com a CPU cortada, o DNS levava ~20 s e todo envio
+# falhou. Este vigia roda FORA, no GitHub, a cada 5 min. Sem segredo aqui.
+#
+# Como avisa:
+#   caiu            -> a rodada fica vermelha e o GitHub manda e-mail ao dono
+#   continua fora   -> nova rodada vermelha a cada 1 h (lembrete); as outras ficam verdes com alerta
+#   voltou          -> estado volta a "ok" (e aviso no ntfy, se o segredo NTFY_URL existir)
+# Estado em estado.txt ("ok" ou "fora <inicio> <ultimo_aviso>", em segundos).
+# Ele só muda na queda, no lembrete, na volta e na ronda mensal.
+name: vigia
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+    - cron: "17 3 1 * *" # ronda mensal: o GitHub desliga a agenda de repositório público sem atividade em 60 dias
+  workflow_dispatch:
+    inputs:
+      simular:
+        description: "Simular uma queda (acrescenta um endereço que não existe)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vigia
+  cancel-in-progress: false
+
+jobs:
+  vigiar:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    env:
+      GH_TOKEN: ${{ github.token }}
+      NTFY_URL: ${{ secrets.NTFY_URL }}
+      LEMBRETE: "3600"
+      ENDERECOS: >-
+        https://app.formulamidia.com.br/
+        https://chat.formulamidia.com.br/
+        https://crm.formulamidia.com.br/
+    steps:
+      - name: Testar os endereços
+        id: teste
+        env:
+          SIMULAR: ${{ inputs.simular }}
+        run: |
+          [ "$SIMULAR" = true ] && ENDERECOS="$ENDERECOS https://simulado-queda.invalid/"
+          fora=""
+          for url in $ENDERECOS; do
+            for tentativa in 1 2 3; do
+              code=$(curl -s -o /dev/null -m 20 -w '%{http_code}' "$url") || code=000
+              case "$code" in 2??|3??|401|403) break ;; esac   # pedir login também é estar de pé
+              [ "$tentativa" -lt 3 ] && sleep 40
+            done
+            case "$code" in
+              2??|3??|401|403) echo "ok   $url ($code)" ;;
+              *) echo "FORA $url ($code)"; fora="$fora ${url#https://}($code)" ;;
+            esac
+          done
+          echo "fora=${fora# }" >> "$GITHUB_OUTPUT"
+
+      - name: Comparar com a rodada anterior e avisar
+        env:
+          FORA: ${{ steps.teste.outputs.fora }}
+          EVENTO: ${{ github.event.schedule }}
+        run: |
+          R="$GITHUB_REPOSITORY"; agora=$(date +%s); hora=$(TZ=America/Manaus date '+%d/%m %H:%M')
+          sha=$(gh api "repos/$R/contents/estado.txt" --jq .sha 2>/dev/null || true)
+          estado=$(gh api "repos/$R/contents/estado.txt" -H "Accept: application/vnd.github.raw" 2>/dev/null || echo ok)
+          read -r anterior inicio ultimo <<< "$estado"
+          desde() { TZ=America/Manaus date -d "@${inicio:-$agora}" '+%d/%m %H:%M'; }
+          grava() { gh api -X PUT "repos/$R/contents/estado.txt" -f message="$1" \
+                      -f content="$(printf '%s\n' "$2" | base64 -w0)" ${sha:+-f sha="$sha"} >/dev/null; }
+          ntfy() { [ -n "$NTFY_URL" ] && curl -fsS -m 20 -H "Title: $1" -H "Priority: $2" -d "$3" "$NTFY_URL" >/dev/null || true; }
+          if [ -n "$FORA" ]; then
+            if [ "$anterior" != fora ]; then
+              grava "fora do ar: $FORA" "fora $agora $agora"
+              ntfy "VPS DA FORMULA FORA DO AR" high "Sem resposta vista de fora (GitHub): $FORA, desde $hora (Manaus). hPanel > VPS > Backups & Monitoring > Server Usage."
+              echo "::error::Fora do ar desde $hora (Manaus): $FORA"
+              exit 1
+            elif [ $((agora - ${ultimo:-0})) -ge "$LEMBRETE" ]; then
+              grava "ainda fora: $FORA" "fora ${inicio:-$agora} $agora"
+              ntfy "VPS da Formula ainda fora" high "$FORA, fora desde $(desde) (Manaus)."
+              echo "::error::Ainda fora desde $(desde) (Manaus): $FORA"
+              exit 1
+            else
+              echo "::warning::Ainda fora desde $(desde) (Manaus), já avisado: $FORA"
+            fi
+          elif [ "$anterior" = fora ]; then
+            grava "voltou às $hora" "ok $agora"
+            ntfy "VPS da Formula voltou" default "Respondendo de novo desde $hora (Manaus). Estava fora desde $(desde)."
+            echo "::notice::Voltou às $hora (Manaus); estava fora desde $(desde)"
+          elif [ "$EVENTO" = "17 3 1 * *" ]; then
+            grava "ronda mensal: tudo no ar" "ok $agora"
+          fi
